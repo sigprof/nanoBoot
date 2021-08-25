@@ -712,7 +712,8 @@ SET_HID_REPORT:
 
       ; Acknowledge the SETUP packet and wait for command from the host
       ldi         r17, ~(_BV(RXSTPI))           ; Clear the Received SETUP Interrupt Flag (RXSTPI) in r17
-      rcall       clear_bit_and_wait_RXOUTI     ; This function loads r17 with value of UEINTX
+      ldi         r16, _BV(RXOUTI)
+      rcall       clear_UEINTX_bit_and_wait     ; This function loads r17 with value of UEINTX
 
 load_page_address:
       ldd         r30, Y+oUEDATX                ; Load r30 with LSB of page address
@@ -750,8 +751,8 @@ erase_page:
       rcall       do_SPM                        ; execute page erase (this function requires r17 to be loaded first with the right value for SPMCSR)
 
 clear_current_page_byte_address:
-      ldi         r16, (SPM_PAGESIZE/2)         ; load r16 with the number of words per page (128 bytes/2 = 64 words)
-                                                ; r16 will be decremented for every word (2 bytes) we write to the page buffer
+      ldi         r27, (SPM_PAGESIZE/2)         ; load r27 with the number of words per page (128 bytes/2 = 64 words)
+                                                ; r27 will be decremented for every word (2 bytes) we write to the page buffer
 
 check_endpoint_for_more_data:
 
@@ -765,7 +766,8 @@ check_endpoint_for_more_data:
 
       ; Acknowledge the OUT packet and wait for more data from the host
       ldi         r17, ~(_BV(RXOUTI))           ; Clear the Received OUT Data Interrupt Flag (RXOUTI) in r17
-      rcall       clear_bit_and_wait_RXOUTI     ; This function loads r17 with value of UEINTX
+      ;ldi         r16, _BV(RXOUTI)
+      rcall       clear_UEINTX_bit_and_wait     ; This function loads r17 with value of UEINTX
 
 fill_page_buffer:                               ; There's data at the endpoint buffer, start fill_page_buffer sequence
 
@@ -782,8 +784,8 @@ increment_byte_address:
                                                 ; Only the low byte needs to be incremented, because the block start address must be page aligned,
                                                 ; therefore any carry to the high byte may happen only past the end of the block.
 
-      dec         r16                           ; decrement r16 (number of words per page)
-      brne        check_endpoint_for_more_data  ; loop while r16 is not equal to SPM_PAGESIZE (128)
+      dec         r27                           ; decrement r27 (number of words per page)
+      brne        check_endpoint_for_more_data  ; loop while r27 is not equal to SPM_PAGESIZE (128)
 
       ; Restore the page address in Z-Register
       subi        r30, SPM_PAGESIZE             ; Move the address back to the start of page (again only the low byte needs to be changed).
@@ -800,7 +802,8 @@ finish_hid_request:
 
       ; Acknowledge the OUT packet and wait for TXINI (OK to transmit)
       ldi         r17, ~(_BV(RXOUTI))           ; Clear the Received OUT Data Interrupt Flag (RXOUTI) in r17
-      rcall       clear_bit_and_wait_TXINI      ; This function loads r17 with value of UEINTX
+      ldi         r16, _BV(TXINI)
+      rcall       clear_UEINTX_bit_and_wait     ; This function loads r17 with value of UEINTX
 
       ; Clear Transmitter Ready Flag
       ldi         r17, ~(_BV(TXINI))            ; Clear the Transmitter Ready Interrupt Flag (TXINI) in r17
@@ -836,7 +839,7 @@ eeprom_wait:
       sbic        _SFR_IO_ADDR(EECR), EEPE
       rjmp        eeprom_wait
 
-      ldi         r16, (SPM_PAGESIZE/2)-2       ; load r16 with the number of words to be consumed
+      ldi         r27, (SPM_PAGESIZE/2)-2       ; load r27 with the number of words to be consumed
       rjmp        check_endpoint_for_more_data
 
 HANDLE_USB_STANDARD_DEVICE:
@@ -940,9 +943,8 @@ send_descriptor:
       reti                                      ; Return if RXSTPI is set, we need to prioritize SETUP packets
 
       ; NOTE: R17 already has the most current value of UEINTX, no need to load it again
-      sbrs        r17, RXOUTI                   ; Skip the next instruction if the Received OUT Data Interrupt Flag (RXOUTI) is set (there's an OUT packet from the host)
-      sbrs        r17, TXINI                    ; Skip the next instruction if the Transmitter Ready Interrupt Flag (TXINI) is set (endpoint is ready to send data)
-      rjmp        wait_finish_transfer          ; jump to finish_transfer
+      sbrc        r17, RXOUTI                   ; Skip the next instruction if the Received OUT Data Interrupt Flag (RXOUTI) is not set
+      rjmp        send_ack_out                  ; OUT received - the host aborted the data phase
 
       ; ASSUMPTION!! reg_wLengthL already has the maximum valid length we can use to send the descriptor,
       ; so we can just keep decrementing it until it reaches Zero
@@ -959,16 +961,12 @@ send_packet_done:
 
       ; Clear Transmitter Ready Flag
       ldi         r17, ~(_BV(TXINI))            ; Clear the Transmitter Ready Interrupt Flag (TXINI) in r17
-      std         Y+oUEINTX, r17                ; Store r17 to the USB Endpoint Interrupt Register (UEINTX)
-
-      ; Wait for the host to send an OUT packet (RXOUTI to assert), but abort if a SETUP packet is received
-wait_finish_transfer:
-      ldd         r17, Y+oUEINTX                ; Load r17 with the most current value in the USB Endpoint Interrupt Register (UEINTX);
+      ldi         r16, _BV(RXOUTI) | _BV(RXSTPI)
+      rcall       clear_UEINTX_bit_and_wait
       sbrc        r17, RXSTPI                   ; Skip the next instruction if the Received SETUP Interrupt Flag (RXSTPI) is cleared
       reti                                      ; Return if RXSTPI is set, we need to prioritize SETUP packets
-      sbrs        r17, RXOUTI                   ; Skip the next instruction if the Received OUT Data Interrupt Flag (RXOUTI) is set (there's already an OUT packet from the host)
-      rjmp        wait_finish_transfer          ; Loop back to finish_transfer if none of RXSTPI or RXOUTI flags are set
 
+send_ack_out:
       ; Acknowledge the OUT packet
       ldi         r17, ~(_BV(RXOUTI))           ; Clear the Received OUT Data Interrupt Flag (RXOUTI) in r17
       std         Y+oUEINTX, r17                ; Store r17 to the USB Endpoint Interrupt Register (UEINTX)
@@ -1037,36 +1035,22 @@ process_Host2Device:
 
       ; Acknowledge the SETUP packet and wait for TXINI (OK to transmit)
       ldi         r17, ~(_BV(RXSTPI))           ; Clear the Received SETUP Interrupt Flag (RXSTPI) in r17
-      rcall       clear_bit_and_wait_TXINI      ; This function loads r17 with value of UEINTX
+      ldi         r16, _BV(TXINI)
+      rcall       clear_UEINTX_bit_and_wait     ; This function loads r17 with value of UEINTX
 
       ; Clear Transmitter Ready Flag and wait for TXINI (OK to transmit)
       ldi         r17, ~(_BV(TXINI))            ; Clear the Transmitter Ready Interrupt Flag (TXINI) in r17
-clear_bit_and_wait_TXINI:
+
+clear_UEINTX_bit_and_wait:
       std         Y+oUEINTX, r17                ; Store r17 to the USB Endpoint Interrupt Register (UEINTX)
-wait_TXINI:
+wait_for_UEINTX_bit:
 
       ; NOTE: This function uses r17, we can use this fact to code other stuff
       ; that happens before and after this functions is called
 
-      ; Wait for TXINI (OK to transmit)
-      ldd         r17, Y+oUEINTX                ; Load r17 with the value in the USB Endpoint Interrupt Register (UEINTX)
-      sbrs        r17, TXINI                    ; Check the value of bit TXINI in r17, skip the next instruction if set
-      rjmp        wait_TXINI                    ; Bit TXINI is not set, keep waiting
-
-      ret                                       ; Return from call
-
-
-clear_bit_and_wait_RXOUTI:
-      std         Y+oUEINTX, r17                ; Store r17 to the USB Endpoint Interrupt Register (UEINTX)
-wait_RXOUTI:
-
-      ; NOTE: This function uses r17, we can use this fact to code other stuff
-      ; that happens before and after this functions is called
-
-      ; Wait for RXOUTI (OUT data received from the host)
       ldd         r17, Y+oUEINTX                ; Load r17 with the value in the USB Endpoint Interrupt Register (UEINTX);
-      sbrs        r17, RXOUTI                   ; Skip the next instruction if the Received OUT Data Interrupt Flag (RXOUTI) is set
-      rjmp        wait_RXOUTI                   ; Bit RXOUTI not set, keep waiting
+      and         r17, r16                      ; Apply the mask to test the bit values
+      breq        wait_for_UEINTX_bit           ; The requested bit is not set, keep waiting
 
       ret                                       ; Return from call
 
