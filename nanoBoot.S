@@ -733,10 +733,13 @@ check_page_address:
       ; Bit 7 of reg_bRequest is used for that purpose - is is known to be 0 in the normal case.
       sbr         reg_bRequest, _BV(7)          ; Set the "disable flash write" bit
 
-      ; If the address is out of the allowed range for flash write, it may be the special value for the
-      ; START_APPLICATION command (0xffff); check for that value in the shortest way possible.
-      adiw        r30, 1                        ; Increment the address to turn 0xffff into 0x0000
-      brne        erase_page                    ; If the address was out of range and not 0xffff, jump to the regular flash write code
+      ; If the address is out of the allowed range for flash write, it may be one of the special values:
+      ;   0xfffe - EEPROM_WRITE command
+      ;   0xffff - START_APPLICATION command
+      ; Check for these values in the shortest way possible.
+      adiw        r30, 2                        ; Change 0xfffe -> 0x0000, 0xffff -> 0x0001
+      breq        eeprom_write                  ; If the address was 0xfffe, jump to the EEPROM_WRITE handling code
+      brcc        erase_page                    ; If the address was less than 0xfffe (i.e., not 0xffff), jump to the regular flash write code
                                                 ; (which would just consume the OUT data to make USB work properly).
       clt                                       ; Otherwise (the address was 0xffff) clear the BootLoaderActive flag (T flag in SREG),
                                                 ; then fallthrough to the regular flash write code too.
@@ -806,6 +809,35 @@ finish_hid_request:
 UNHANDLED_DEVICE_TO_HOST:
       rjmp        UNHANDLED_SETUP_REQUEST       ; Go to UNHANDLED_SETUP_REQUEST
 
+eeprom_write:
+      ; EEPROM byte write operation.  4 bytes of parameters are expected in
+      ; the OUT data after the special address value:
+      ;   address (2 bytes, low byte first)
+      ;   data (1 byte)
+      ;   dummy (1 byte) for alignment
+      
+      ; Read EEPROM address from the packet data
+      ldd         r30, y+oUEDATX
+      ldd         r31, y+oUEDATX
+
+      ; Read the data byte to be written from the packet data.
+      ldd         r0, y+oUEDATX
+      ldd         r1, y+oUEDATX
+
+      ; Start the EEPROM write operation.
+      out         _SFR_IO_ADDR(EEARL), r30
+      out         _SFR_IO_ADDR(EEARH), r31
+      out         _SFR_IO_ADDR(EEDR), r0
+      sbi         _SFR_IO_ADDR(EECR), EEMPE
+      sbi         _SFR_IO_ADDR(EECR), EEPE
+
+      ; Wait for the EEPROM write to complete.
+eeprom_wait:
+      sbic        _SFR_IO_ADDR(EECR), EEPE
+      rjmp        eeprom_wait
+
+      ldi         r16, (SPM_PAGESIZE/2)-2       ; load r16 with the number of words to be consumed
+      rjmp        check_endpoint_for_more_data
 
 HANDLE_USB_STANDARD_DEVICE:
 
