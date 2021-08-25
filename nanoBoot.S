@@ -397,10 +397,10 @@ main:
       ;     YL=lo8(USB_BASE)  main routine
       ;     YL=lo8(EIO_BASE)  exit routine
       clr         YH                            ; 0 = hi8(USB_BASE)
-      ldi         YL, lo8(EIO_BASE)             ; Load YL with EIO_BASE (initial)
       mov         r17,  rZERO                   ; Load r17 with zero to disable the Watchdog Timer completely
 
       rcall       set_watchdog_timer            ; Call the subroutine that sets the watchdog timer with the value loaded in r17
+                                                ; This also loads YL with EIO_BASE, which is used by subsequent initialization code.
 
 ; check_reset_flags:
       sbrs        rMCUSR, EXTRF                 ; Skip the next instruction if EXTRF is set (if External Reset Flag, skip next instruction, go to run_bootloader)
@@ -626,12 +626,12 @@ exit_bootloader:
 
       ; NOTE!! This part of the code assumes MCUSR has already been cleared
 
-      ldi         YL, lo8(EIO_BASE)             ; Load YL with EIO_BASE (exit)
       ; Enable WDT, ~250 ms timeout (force a timeout to reset the AVR)
       ldi         r17, _BV(WDE) | _BV(WDP2)     ; Load r17 with the value needed to set the desired Watchdog Configuration (WDCE = 0, not set!)
                                                 ; Write the WDE and Watchdog prescaler bits (WDP); System Reset Mode (WDE = 1) and ~250 ms timeout (WDP2 = 1)
 
       rcall       set_watchdog_timer            ; Call the subroutine that sets the watchdog timer with the value loaded in r17
+                                                ; This also loads YL with EIO_BASE.
 
    ; for (;;);
 final_loop:
@@ -1089,11 +1089,14 @@ EP_ISR_END:
 
 set_watchdog_timer:
 
-      ; IMPORTANT!! This function assumes the correct value for the WDTCSR register
-      ; configuration is already loaded onto r17; it also modifies r16.
+      ; Input:
+      ;   - r17 - new value for the WDTCSR register.
+      ; Assumption: YH must be set to 0 (== hi8(EIO_BASE)) before calling the function.
+      ; Additional side effects:
+      ;   - YL is set to lo8(EIO_BASE)
+      ;   - r16 is modified
 
-      ; always set YH to hi(EIO_BASE) before calling
-
+      ldi         YL, lo8(EIO_BASE)             ; Load YL with EIO_BASE (YH is assumed to be initialized with 0)
       ldi         r16, _BV(WDCE) | _BV(WDE)     ; Load r16 with the value needed to "unlock" the Watchdog Timer Configuration
                                                 ; Write a logic one to the Watchdog Change Enable bit (WDCE) and Watchdog System Reset Enable (WDE)
 
