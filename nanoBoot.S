@@ -130,10 +130,10 @@
 ; Register Assignments:
 ; R0  =  temp
 ; R1  =  temp (traditionally, R1 stores constant 0, but we use it as temp because SPM uses R1:R0)
-; R2  =  0 (common constant, use instead of traditional R1)
 ; R3  =  1 (common constant, number is used constantly in the code)
 ; R4  =  copy of MCUSR (MCU Status Register)
-; Y   =  USB_BASE
+; Y   =  USB_BASE (or EIO_BASE during init and exit)
+; R29 =  0 (common constant, use instead of traditional R1) - the high byte of USB_BASE and EIO_BASE is known to be 0
 
 ; Global Flags:
 ; T Flag (SREG) = BootLoaderActive
@@ -141,7 +141,7 @@
 
 ; Global Defines:
 
-#define rZERO              r2
+#define rZERO              r29
 #define rONE               r3
 #define rMCUSR             r4
 
@@ -220,7 +220,7 @@
 
 reset_vector:
       cli                     ; Possibly unnecessary, maybe do something else?
-      clr         rZERO       ; Initialize rZERO (R2 register = zero)
+      clr         rZERO       ; Initialize rZERO (R29 (YH) register = zero)
       rjmp        main        ; Jump to main
 
 ; We are "hiding" the USB descriptors in the Interrupt Vector Table
@@ -391,16 +391,11 @@ main:
 
       ; We MUST disable the Watchdog Timer first, otherwise it will remain enabled and will keep resetting the system, so...
       ; Disable Watchdog Timer
-
-      ; Set YH=R29 to 0 for addressing extended io for any 64 bytes of YL specified section.
-      ;     YL=lo8(EIO_BASE)  initial routine
-      ;     YL=lo8(USB_BASE)  main routine
-      ;     YL=lo8(EIO_BASE)  exit routine
-      clr         YH                            ; 0 = hi8(USB_BASE)
       mov         r17,  rZERO                   ; Load r17 with zero to disable the Watchdog Timer completely
 
       rcall       set_watchdog_timer            ; Call the subroutine that sets the watchdog timer with the value loaded in r17
                                                 ; This also loads YL with EIO_BASE, which is used by subsequent initialization code.
+                                                ; YH is initialized to contain 0 earlier.
 
 ; check_reset_flags:
       sbrs        rMCUSR, EXTRF                 ; Skip the next instruction if EXTRF is set (if External Reset Flag, skip next instruction, go to run_bootloader)
@@ -473,7 +468,7 @@ run_bootloader:
       ; code to work as expected.
 
       ldi         r17, _BV(CLKPCE)                ; Load r17 with the value needed to "unlock" the prescaler of the Clock; Clock Prescaler Change Enable bit (CLKPCE) set to one, all other bits set to zero.
-                                                  ; still YH=0, YL=lo8(EIO_BASE)  initial routine
+                                                  ; still YH=0, YL=lo8(EIO_BASE) after the set_watchdog_timer call
       std         Y+oCLKPR, r17                   ; Store r17 to the Clock Prescaler Register (CLKPR)
       std         Y+oCLKPR, rZERO                 ; Store rZERO to the Clock Prescaler Register (CLKPR), setting CLKPS3, CLKPS2, CLKPS1 and CLKPS0 to zero (Clock Division Factor = 1; System Clock is 16 MHz)
 
@@ -487,7 +482,7 @@ run_bootloader:
 ; =================================================================
 
       ldi         YL, lo8(USB_BASE)             ; Load YL with the least significant 8 bits of USB_BASE
-                                                ; still YH=0
+                                                ; YH is already initialized with 0, therefore the following instruction is not needed:
       ; ldi         YH, hi8(USB_BASE)           ; Load YH with the most significant 8 bits of USB_BASE
 
       ; =================================================================
