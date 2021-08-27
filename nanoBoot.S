@@ -937,8 +937,9 @@ UNHANDLED_SETUP_REQUEST:
 
       ; // Endpoint_StallTransaction();
       ; UECONX |= (1 << STALLRQ);
-      ldd         r16, Y+oUECONX                ; Load r16 with the value in the USB Endpoint Configuration Register (UECONX)
-      ori         r16, _BV(STALLRQ)             ; Set the STALL Request Handshake Bit (STALLRQ) in r16
+      ; Size optimization: We know that the only other bit that should be set in UECONX is EPEN, therefore
+      ; reading the current register value is not needed.
+      ldi         r16, _BV(STALLRQ) | _BV(EPEN) ; Set the STALL Request Handshake Bit (STALLRQ) and EPEN in r16
       std         Y+oUECONX, r16                ; Store r16 to the USB Endpoint Configuration Register (UECONX)
 
 
