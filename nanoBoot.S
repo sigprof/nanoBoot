@@ -56,8 +56,8 @@
 ; Register Assignments:
 ; R0  =  temp
 ; R1  =  temp (traditionally, R1 stores constant 0, but we use it as temp because SPM uses R1:R0)
+; R2  =  copy of MCUSR (MCU Status Register)
 ; R3  =  1 (common constant, number is used constantly in the code)
-; R4  =  copy of MCUSR (MCU Status Register)
 ; Y   =  USB_BASE (or EIO_BASE during init and exit)
 ; R29 =  0 (common constant, use instead of traditional R1) - the high byte of USB_BASE and EIO_BASE is known to be 0
 
@@ -69,7 +69,7 @@
 
 #define rZERO              r29
 #define rONE               r3
-#define rMCUSR             r4
+#define rMCUSR             r2
 
 ; #define rMagicBootKeyL     r26    ; currently not used - XL
 ; #define rMagicBootKeyH     r27    ; currently not used - XH
