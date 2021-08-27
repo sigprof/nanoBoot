@@ -213,6 +213,26 @@
 # define BOOT_ADDRESS 0
 #endif
 
+; Workaround for a bug in avr-libc: USBRF is not defined for ATmega{16,32}U4 for some reason
+#if !defined(USBRF) && (defined(__AVR_ATmega16U4__) || defined(__AVR_ATmega32U4__))
+# define USBRF 5
+#endif
+
+; Some reset source bits are not present on all potentially supportable devices.
+#ifdef USBRF
+# define MCUSR_USBRF_MASK       _BV(USBRF)
+#else
+# define MCUSR_USBRF_MASK       0
+#endif
+#ifdef JTRF
+# define MCUSR_JTRF_MASK        _BV(JTRF)
+#else
+# define MCUSR_JTRF_MASK        0
+#endif
+
+; Mask of all possible reset source bits in MCUSR except EXTRF.
+#define MCUSR_APP_RESET_FLAGS   (MCUSR_USBRF_MASK | MCUSR_JTRF_MASK | _BV(WDRF) | _BV(BORF) | _BV(PORF))
+
       .section    .vectors
 
       ; We still want the reset vector to jump to "main"
@@ -398,9 +418,21 @@ main:
                                                 ; YH is initialized to contain 0 earlier.
 
 ; check_reset_flags:
+      ; Provide a way for the application to request starting the bootloader even without the actual
+      ; external reset.  If the application clears all possible reset source bits in the MCUSR register
+      ; (e.g., by setting MCUSR to 0) before jumping to the bootloader start address, this code will
+      ; start the bootloader even though the EXTRF bit was not set.
+      ldi         r17, MCUSR_APP_RESET_FLAGS    ; Load the mask of all known reset source bits except EXTRF
+      and         r17, rMCUSR                   ; Apply the above mask to the MCUSR value
+      breq        run_bootloader                ; If no reset source bits were set, start the bootloader
+
+      ; If the EXTRF bit in MCUSR was set, enter the bootloader irrespective of the state of any other
+      ; reset source bits (those other bits might still be set if the application does not reset MCUSR
+      ; properly as advised in the datasheet, and any attempt to honor those bits when EXTRF is also set
+      ; might result in being unable to enter the bootloader after flashing a broken firmware).
       sbrs        rMCUSR, EXTRF                 ; Skip the next instruction if EXTRF is set (if External Reset Flag, skip next instruction, go to run_bootloader)
 
-run_application:                                ; We get here if the cause of the reset was anything but an Extenal Reset (push-button)
+run_application:                                ; We get here if the cause of the reset was anything but an External Reset (push-button)
       jmp         0                             ; Simply jump to 0x0000 (application) IMPORTANT NOTE!! This CANNOT be an 'rjmp'!!
 
 run_bootloader:
