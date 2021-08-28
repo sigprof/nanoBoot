@@ -590,29 +590,55 @@ USB_General_ISR:
 ; service_EORSTI:                              ; unused label
 
 ; =================================================================
-; = Configure Endpoint0
+; = Configure Endpoints
 ; =================================================================
 
-      ; ASSUMPTION!
-      ; We only use Endpoint0, and the reset value of the USB Device Select Endpoint Number Register (UENUM) is Zero,
-      ; so we don't need to select it or do anything else
+      ; Even though the bootloader uses only endpoint 0, the HID spec requires any HID device to have an
+      ; Interrupt IN endpoint, and the host can decide to poll that endpoint even when the HID report
+      ; descriptor does not actually declare any input reports.  Polling an unconfigured endpoint causes
+      ; USB errors, therefore endpoint 1 must be configured here too.
 
-      ; Enable Endpoint
+      ; Enable and configure endpoint 1 as Interrupt IN:
+      ; UENUM = 1;
+      ; UECONX |= (1 << EPEN);
+      ; UECFG0X = (1 << EPTYPE1) | (1 << EPTYPE0) | (1 << EPDIR);
+      ; UECFG1X = (1 << EPSIZE1) | (1 << EPSIZE0) | (1 << ALLOC);
+
+      std         Y+oUENUM, rONE                ; Select Endpoint 1
+
+                                                ; Set Endpoint Enable Bit (EPEN), all other bits set to zero has no effect on UECONX
+      std         Y+oUECONX, rONE               ; Store the USB Endpoint Configuration Register (UECONX) with the value needed to enable Endpoint 1
+
+      ldi         r16, (_BV(EPTYPE1) | _BV(EPTYPE0) | _BV(EPDIR)) ; Load r16 with the value to configure Endpoint 1
+                                                                  ; Endpoint Type Bits (EPTYPE1:0); 11 to set as Interrupt Endpoint
+                                                                  ; Endpoint Direction Bit (EPDIR); set to configure IN direction
+
+      std         Y+oUECFG0X, r16               ; Store r16 to the USB Endpoint Configuration0 Register (UECFG0X);
+
+      ldi         r16, (_BV(EPSIZE1) | _BV(EPSIZE0) | _BV(ALLOC)) ; Load r16 with the value to configure Endpoint 1 (and also 0 below)
+                                                                  ; Endpoint Size Bits (EPSIZE2:0); 011 to set to 64 bytes
+                                                                  ; Endpoint Bank Bits (EPBK1:0); 00 to set One bank
+                                                                  ; Endpoint Allocation Bit (ALLOC); set to allocate the endpoint memory
+
+      std         Y+oUECFG1X, r16               ; Store r16 to the USB Endpoint Configuration1 Register (UECFG1X);
+
+      ; Enable and configure endpoint 0 as Control (this is done last, so that endpoint 0 will remain selected):
+      ; UENUM = 0;
       ; UECONX |= (1 << EPEN);
       ; UECFG0X = 0;
-      ; UECFG1X = 0x32;
+      ; UECFG1X = (1 << EPSIZE1) | (1 << EPSIZE0) | (1 << ALLOC);
+
+      std         Y+oUENUM, rZERO               ; Select Endpoint0
+
                                                 ; Set Endpoint Enable Bit (EPEN), all other bits set to zero has no effect on UECONX
-      std         Y+oUECONX, rONE               ; Store the USB Endpoint Configuration Register (UECONX) with the value needed to enable Enpoint 0
+      std         Y+oUECONX, rONE               ; Store the USB Endpoint Configuration Register (UECONX) with the value needed to enable Endpoint 0
 
       ; SIZE OPTIMIZATION: Not needed due to known reset value (Zero)
       ; std         Y+oUECFG0X, rZERO             ; Store rZERO to the USB Endpoint Configuration0 Register (UECFG0X);
                                                 ; Endpoint Type Bits (EPTYPE1:0): 00 to set as Control Endpoint
                                                 ; Endpoint Direction Bit (EPDIR): clear to configure OUT direction; needed for Control Endpoint
 
-      ldi         r16, (_BV(EPSIZE1) | _BV(EPSIZE0) | _BV(ALLOC)) ; Load r16 with the value to configure Enpoint 0
-                                                                  ; Endpoint Size Bits (EPSIZE2:0); 011 to set to 64 bytes
-                                                                  ; Endpoint Bank Bits (EPBK1:0); 00 to set One bank
-                                                                  ; Endpoint Allocation Bit (ALLOC); set to allocate the endpoint memory
+      ; SIZE OPTIMIZATION: r16 is already loaded with the required value while configuring endpoint 1 above
 
       std         Y+oUECFG1X, r16               ; Store r16 to the USB Endpoint Configuration1 Register (UECFG1X);
 
@@ -657,11 +683,10 @@ USB_Endpoint_ISR:
       ; Shorter version
       clr         XH                            ; Clear XH Register
       ldi         XL, 18                        ; Load XL Register with number 18 (this will be used to refer to r18)
-      ldi         r16, 8                        ; Load r16 with number 8 (the number of fields <SETUP Packets> we need to read)
 load: ldd         r0, Y+oUEDATX                 ; Load r0 with the value in the USB Endpoint Data Register (UEDATX)
       st          X+, r0                        ; Store the value of r0 to the location pointed by X (r18), post increment X (X now points to r19)
-      dec         r16                           ; Decrement r16
-      brne        load                          ; Jump back to 'load' if r16 is not zero
+      cpi         XL, 18+8                      ; Compare XL with the location past the last byte that we need to read
+      brne        load                          ; Jump back to 'load' if there are still bytes to read
 
       ; Our response is based on data direction...
       sbrc        reg_bmRequestType, 7          ; Skip the next instruction if bit 7 of bmRequestType is not set; for host to device (OUT) transaction, bit 7 is cleared
@@ -676,9 +701,13 @@ HOST_TO_DEVICE:
 
       andi        reg_bmRequestType, (0x60 | 0x1F)          ; Mask reg_bmRequestType with the bits that define request type and recipient (CONTROL_REQTYPE_TYPE | CONTROL_REQTYPE_RECIPIENT)
       cpi         reg_bmRequestType, ((1 << 5) | (1 << 0))  ; Compare the masked value in r16 with the value that defines the request type and recipient we care about HID_SET_REPORT (REQTYPE_CLASS | REQREC_INTERFACE)
-      breq        HANDLE_USB_CLAS_INTERFACE                 ; jump to HANDLE_USB_CLAS_INTERFACE
-
+      brne        UNHANDLED_SETUP_REQUEST_1     ; jump to UNHANDLED_SETUP_REQUEST through a thunk if not equal
+                                                ; fallthrough to HANDLE_USB_CLAS_INTERFACE if equal
+HANDLE_USB_CLAS_INTERFACE:
+      cpi         reg_bRequest, 0x09            ; Compare bRequest with value 0x05 (HID_REQ_SetReport)
+      breq        SET_HID_REPORT                ; jump to SET_HID_REPORT
       rjmp        UNHANDLED_SETUP_REQUEST       ; If reg_bmRequestType is not 0x00 or bRequest is not 0x05 or 0x09, we don't handle those cases, so jump to UNHANDLED_SETUP_REQUEST
+
 
 HANDLE_USB_STANDARD_DEVICE:
 
@@ -686,15 +715,14 @@ HANDLE_USB_STANDARD_DEVICE:
       cpi         reg_bRequest, 0x05            ; Compare bRequest with value 0x05 (REQ_SetAddress)
       breq        SET_ADDRESS                   ; jump to SET_ADDRESS
       cpi         reg_bRequest, 0x09            ; Compare bRequest with value 0x09 (REQ_SetConfiguration)
-      breq        SET_CONFIGURATION             ; jump to SET_CONFIGURATION
+      brne        UNHANDLED_SETUP_REQUEST_1     ; jump to UNHANDLED_SETUP_REQUEST through a thunk if not equal
+                                                ; fallthrough to SET_CONFIGURATION if equal
+SET_CONFIGURATION:
 
-      rjmp        UNHANDLED_SETUP_REQUEST       ; If reg_bmRequestType is not 0x00 or bRequest is not 0x05 or 0x09, we don't handle those cases, so jump to UNHANDLED_SETUP_REQUEST
+      ; Dirty trick: We don't need to do anything for SET_CONFIGURATION except process_Host2Device,
+      ; so we reuse the SET_ADDRESS code by making it reload the same value to UDADDR.
 
-HANDLE_USB_CLAS_INTERFACE:
-      cpi         reg_bRequest, 0x09            ; Compare bRequest with value 0x05 (HID_REQ_SetReport)
-      breq        SET_HID_REPORT                ; jump to SET_HID_REPORT
-      rjmp        UNHANDLED_SETUP_REQUEST       ; If reg_bmRequestType is not 0x00 or bRequest is not 0x05 or 0x09, we don't handle those cases, so jump to UNHANDLED_SETUP_REQUEST
-
+      ldd         reg_wValueL, Y+oUDADDR        ; load the existing UDADDR value where the SET_ADDRESS code would expect the new address
 
 SET_ADDRESS:
 
@@ -713,14 +741,8 @@ SET_ADDRESS:
       ori         reg_wValueL, _BV(ADDEN)       ; In order to save space, we simply OR the address value already in reg_wValueL (r20) with the ADDEN bit to enable the USB Address
       std         Y+oUDADDR, reg_wValueL        ; Store reg_wValueL to the USB Device Address Register (UDADDR)
 
+UNHANDLED_SETUP_REQUEST_1:
       rjmp        UNHANDLED_SETUP_REQUEST       ; Go to UNHANDLED_SETUP_REQUEST
-
-SET_CONFIGURATION:
-
-      rcall       process_Host2Device           ; This function affects r17
-
-      rjmp        UNHANDLED_SETUP_REQUEST       ; Go to UNHANDLED_SETUP_REQUEST
-
 
 SET_HID_REPORT:
 
@@ -822,6 +844,7 @@ finish_hid_request:
       ; Clear Transmitter Ready Flag
       rcall       clear_TXINI                   ; This function uses r17 to clear the TXINI bit in UEINTX
 
+UNHANDLED_DEVICE_TO_HOST:
       rjmp        UNHANDLED_SETUP_REQUEST       ; Go to UNHANDLED_SETUP_REQUEST
 
 
@@ -839,11 +862,8 @@ DEVICE_TO_HOST:
       brne        UNHANDLED_DEVICE_TO_HOST      ; If bmRequestType is not 0x80, we know it's not a GET_DESCRIPTOR request, so jump to UNHANDLED_DEVICE_TO_HOST
 
       cpi         reg_bRequest, 0x06            ; Compare bRequest with value 0x06 (REQ_GetDescriptor)
-      breq        GET_DESCRIPTOR                ; jump to GET_DESCRIPTOR
-
-UNHANDLED_DEVICE_TO_HOST:
-      rjmp        UNHANDLED_SETUP_REQUEST       ; If reg_bmRequestType is not 0x80/0x81 or bRequest is not 0x06, we don't handle those cases, so jump to UNHANDLED_SETUP_REQUEST
-
+      brne        UNHANDLED_DEVICE_TO_HOST      ; jump to UNHANDLED_SETUP_REQUEST through a thunk if not equal
+                                                ; fallthrough to GET_DESCRIPTOR if equal
 GET_DESCRIPTOR:
 
       ; Just get the descriptor address into
@@ -877,8 +897,7 @@ send_device_descriptor:
                                                 ; We only load the lower portion (lo8) of the address of the descriptor,
                                                 ; the higher portion is common for all descriptors
       ldi         ZL, lo8(device_descriptor)    ; Load ZL with the least significant 8 bits of device_descriptor
-      ldi         r16, 18                       ; Load r16 with length of device_descriptor (18 bytes)
-      rjmp        process_descriptor            ; jump to process_descriptor
+      rjmp        process_single_descriptor     ; jump to process_single_descriptor
 
 send_config_descriptor:
                                                 ; We only load the lower portion (lo8) of the address of the descriptor,
@@ -887,20 +906,23 @@ send_config_descriptor:
       ldi         r16, 34                       ; Load r16 with length of config_descriptor (34 bytes)
       rjmp        process_descriptor            ; jump to process_descriptor
 
-send_hid_descriptor:
-                                                ; We only load the lower portion (lo8) of the address of the descriptor,
-                                                ; the higher portion is common for all descriptors
-      ldi         ZL, lo8(hid_descriptor)       ; Load ZL with the least significant 8 bits of hid_descriptor
-      ldi         r16, 9                        ; Load r16 with length of hid_descriptor (9 bytes)
-      rjmp        process_descriptor            ; jump to process_descriptor
-
 send_hid_report_descriptor:
                                                 ; We only load the lower portion (lo8) of the address of the descriptor,
                                                 ; the higher portion is common for all descriptors
       ldi         ZL, lo8(hid_report_descriptor); Load ZL with the least significant 8 bits of hid_report_descriptor
       ldi         r16, 21                       ; Load r16 with length of hid_report_descriptor (21 bytes)
+      rjmp        process_descriptor            ; jump to process_descriptor
 
       ; If needed, include other descriptors here
+
+send_hid_descriptor:
+                                                ; We only load the lower portion (lo8) of the address of the descriptor,
+                                                ; the higher portion is common for all descriptors
+      ldi         ZL, lo8(hid_descriptor)       ; Load ZL with the least significant 8 bits of hid_descriptor
+
+process_single_descriptor:
+
+      lpm         r16, Z                        ; Load r16 with the first byte of descriptor, which contains its length in bytes
 
 process_descriptor:
 
