@@ -731,26 +731,33 @@ SET_HID_REPORT:
       rcall       wait_RXOUTI                   ; This function loads r17 with value of UEINTX
 
 load_page_address:
-      ; We store the page address in r15:r14 and not in r31:r30 because we need
-      ; to keep track of the page when we call write_page_to_flash
-      ldd         r14, Y+oUEDATX                ; Load r14 with LSB of page address
-      ldd         r15, Y+oUEDATX                ; Load r15 with MSB of page address
+      ldd         r30, Y+oUEDATX                ; Load r30 with LSB of page address
+      ldd         r31, Y+oUEDATX                ; Load r31 with MSB of page address
 
 check_page_address:
-      ldi         r26, 0xFF                     ; Load value 0xFF to r26
-      cp          r26, r14                      ; Compare low byte of page address against 0xFF
-      cpc         r26, r15                      ; Compare high byte of page address against 0xFF
-      brne        erase_page                    ; if r15:r14 != 0xFFFF jump to erase_page
+      ; Protect against overwriting the bootloader - allow flash write only if the specified address is
+      ; less than the bootloader start address.  Only the high byte needs to be tested, because the
+      ; bootloader start is guaranteed to be on a 256 bytes boundary.
+      cpi         r31, hi8(reset_vector)        ; Compare high byte of page address against the high byte of the bootloader start addresss
+      brcs        erase_page                    ; If the address is below the bootloader start, allow the flash write operation
 
-quit_bootloader:
-      ; we received the START_APPLICATION command, change value of BootLoaderActive flag
-      clt                                       ; clear the BootLoaderActive flag (T flag in SREG)
-      rjmp        finish_hid_request            ; jump to finish_hid_request
+      ; The address is definitely not correct for a flash write operation; however, simply jumping to
+      ; finish_hid_request would not just fail this SET_HID_REPORT request - apparently not reading the
+      ; OUT data properly results in the bootloader not responding to any subsequent USB requests too.
+      ; Instead of doing that, we run the normal flash write loop even if the address was bad, but set
+      ; the "disable flash write" bit, so that the actual flash write instructions will be skipped.
+      ; Bit 7 of reg_bRequest is used for that purpose - is is known to be 0 in the normal case.
+      sbr         reg_bRequest, _BV(7)          ; Set the "disable flash write" bit
+
+      ; If the address is out of the allowed range for flash write, it may be the special value for the
+      ; START_APPLICATION command (0xffff); check for that value in the shortest way possible.
+      adiw        r30, 1                        ; Increment the address to turn 0xffff into 0x0000
+      brne        erase_page                    ; If the address was out of range and not 0xffff, jump to the regular flash write code
+                                                ; (which would just consume the OUT data to make USB work properly).
+      clt                                       ; Otherwise (the address was 0xffff) clear the BootLoaderActive flag (T flag in SREG),
+                                                ; then fallthrough to the regular flash write code too.
 
 erase_page:
-
-      ; Set page address in Z-Register
-      movw        r30, r14                      ; Copy r15:r14 to r31:r30 (Z-Register)
 
       ldi         r17, (_BV(PGERS)|_BV(SPMEN))  ; load r17 with the value needed to erase the currently specified page
       rcall       do_SPM                        ; execute page erase (this function requires r17 to be loaded first with the right value for SPMCSR)
@@ -786,13 +793,15 @@ write_page_buffer:
       rcall       do_SPM                        ; execute page buffer write (this function requires r17 to be loaded first with the right value for SPMCSR)
 
 increment_byte_address:
-      adiw        r30, 2                        ; Increment Z-Register (the current byte address) by 2
+      subi        r30, -2                       ; Increment the current address by 2.
+                                                ; Only the low byte needs to be incremented, because the block start address must be page aligned,
+                                                ; therefore any carry to the high byte may happen only past the end of the block.
 
       dec         r16                           ; decrement r16 (number of words per page)
       brne        check_endpoint_for_more_data  ; loop while r16 is not equal to SPM_PAGESIZE (128)
 
-      ; Set page address in Z-Register
-      movw        r30, r14                      ; Copy r15:r14 (the original page address) back to r31:r30 (Z-Register)
+      ; Restore the page address in Z-Register
+      subi        r30, SPM_PAGESIZE             ; Move the address back to the start of page (again only the low byte needs to be changed).
 
 write_page_to_flash:
       ldi         r17, (_BV(PGWRT)|_BV(SPMEN))  ; load r17 with the value needed to commit the current page buffer to the flash
@@ -1090,7 +1099,12 @@ do_SPM:
 
       ; NOTE: This function assumes r17 already has the correct value for the SPMCSR register, depending on the
       ; desired SPM operation
+      ; NOTE: If bit 7 of reg_bRequest is set to 1, the actual SPM instruction will not be executed
+      ; (the wait loop will still run, but should just complete immediately).
       out         _SFR_IO_ADDR(SPMCSR), r17     ; store value in r17 to the Store Program Memory Control and Status Register (SPMCSR)
+      sbrs        reg_bRequest, 7               ; Skip the actual flash operation if the "disable flash write" bit is set.
+                                                ; This is apparently safe, because the SPM instruction must be executed within 4 cycles after setting SPMEN,
+                                                ; and the sbrs instruction takes just 1 cycle when not skipping.
       spm                                       ; execute spm instruction based on the value loaded to SPMCSR
 
 wait_SPM:
