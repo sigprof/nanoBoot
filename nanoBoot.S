@@ -960,9 +960,8 @@ transfer_descriptor:
 send_packet_done:
 
       ; Clear Transmitter Ready Flag
-      ldi         r17, ~(_BV(TXINI))            ; Clear the Transmitter Ready Interrupt Flag (TXINI) in r17
-      ldi         r16, _BV(RXOUTI) | _BV(RXSTPI)
-      rcall       clear_UEINTX_bit_and_wait
+      ldi         r16, _BV(RXOUTI) | _BV(RXSTPI) ; Load the mask specifying the UEINTX bits to wait for (RXOUTI and RXSTPI)
+      rcall       clear_TXINI_and_wait          ; Clear the TXINI flag and wait for either RXOUTI or RXSTPI
       sbrc        r17, RXSTPI                   ; Skip the next instruction if the Received SETUP Interrupt Flag (RXSTPI) is cleared
       reti                                      ; Return if RXSTPI is set, we need to prioritize SETUP packets
 
@@ -1038,7 +1037,10 @@ process_Host2Device:
       ldi         r16, _BV(TXINI)
       rcall       clear_UEINTX_bit_and_wait     ; This function loads r17 with value of UEINTX
 
+clear_TXINI_and_wait:
       ; Clear Transmitter Ready Flag and wait for TXINI (OK to transmit)
+      ; This entry point can also be reused by other code that needs to clear the TXINI flag,
+      ; but may need to specify something else than TXINI for the waiting bit mask.
       ldi         r17, ~(_BV(TXINI))            ; Clear the Transmitter Ready Interrupt Flag (TXINI) in r17
 
 clear_UEINTX_bit_and_wait:
