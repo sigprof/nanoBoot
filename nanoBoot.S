@@ -682,6 +682,7 @@ USB_Endpoint_ISR:
 
       ; Shorter version
       clr         XH                            ; Clear XH Register
+                                                ; NOTE: The code in SET_HID_REPORT depends on XH (r27) being 0 on entry.
       ldi         XL, 18                        ; Load XL Register with number 18 (this will be used to refer to r18)
 load: ldd         r0, Y+oUEDATX                 ; Load r0 with the value in the USB Endpoint Data Register (UEDATX)
       st          X+, r0                        ; Store the value of r0 to the location pointed by X (r18), post increment X (X now points to r19)
@@ -701,11 +702,11 @@ HOST_TO_DEVICE:
 
       andi        reg_bmRequestType, (0x60 | 0x1F)          ; Mask reg_bmRequestType with the bits that define request type and recipient (CONTROL_REQTYPE_TYPE | CONTROL_REQTYPE_RECIPIENT)
       cpi         reg_bmRequestType, ((1 << 5) | (1 << 0))  ; Compare the masked value in r16 with the value that defines the request type and recipient we care about HID_SET_REPORT (REQTYPE_CLASS | REQREC_INTERFACE)
-      brne        UNHANDLED_SETUP_REQUEST_1     ; jump to UNHANDLED_SETUP_REQUEST through a thunk if not equal
+      brne        UNHANDLED_DEVICE_TO_HOST      ; jump to UNHANDLED_SETUP_REQUEST through a thunk if not equal
                                                 ; fallthrough to HANDLE_USB_CLAS_INTERFACE if equal
 HANDLE_USB_CLAS_INTERFACE:
       cpi         reg_bRequest, 0x09            ; Compare bRequest with value 0x05 (HID_REQ_SetReport)
-      brne        UNHANDLED_SETUP_REQUEST_1     ; If reg_bmRequestType is not 0x00 or bRequest is not 0x05 or 0x09, we don't handle those cases, so jump to UNHANDLED_SETUP_REQUEST
+      brne        UNHANDLED_DEVICE_TO_HOST      ; If reg_bmRequestType is not 0x00 or bRequest is not 0x05 or 0x09, we don't handle those cases, so jump to UNHANDLED_SETUP_REQUEST
       ; fallthrough to SET_HID_REPORT
 
 SET_HID_REPORT:
@@ -724,36 +725,47 @@ check_page_address:
       ; less than the bootloader start address.  Only the high byte needs to be tested, because the
       ; bootloader start is guaranteed to be on a 256 bytes boundary.
       cpi         r31, hi8(reset_vector)        ; Compare high byte of page address against the high byte of the bootloader start addresss
-      brcs        erase_page                    ; If the address is below the bootloader start, allow the flash write operation
+      brcs        address_in_range              ; If the address is below the bootloader start, proceed with further checks.
+                                                ; Note that the C flag is set when this jump is taken - the code at address_in_range depends on this.
 
       ; The address is definitely not correct for a flash write operation; however, simply jumping to
       ; finish_hid_request would not just fail this SET_HID_REPORT request - apparently not reading the
       ; OUT data properly results in the bootloader not responding to any subsequent USB requests too.
-      ; Instead of doing that, we run the normal flash write loop even if the address was bad, but set
-      ; the "disable flash write" bit, so that the actual flash write instructions will be skipped.
-      ; Bit 7 of reg_bRequest is used for that purpose - is is known to be 0 in the normal case.
-      sbr         reg_bRequest, _BV(7)          ; Set the "disable flash write" bit
+      ; Instead of doing that, we run the normal flash write loop even if the address was bad, but skip
+      ; the actual flash write instructions.
 
-      ; If the address is out of the allowed range for flash write, it may be one of the special values:
-      ;   0xfffe - EEPROM_WRITE command
-      ;   0xffff - START_APPLICATION command
-      ; Check for these values in the shortest way possible.
-      adiw        r30, 2                        ; Change 0xfffe -> 0x0000, 0xffff -> 0x0001
-      breq        eeprom_write                  ; If the address was 0xfffe, jump to the EEPROM_WRITE handling code
-      brcc        erase_page                    ; If the address was less than 0xfffe (i.e., not 0xffff), jump to the regular flash write code
-                                                ; (which would just consume the OUT data to make USB work properly).
-      clt                                       ; Otherwise (the address was 0xffff) clear the BootLoaderActive flag (T flag in SREG),
-                                                ; then fallthrough to the regular flash write code too.
+      ; If the address is out of the allowed range for flash write, it may be the special value for the
+      ; START_APPLICATION command (0xffff); check for that value in the shortest way possible.
+      adiw        r30, 1                        ; If the address was 0xffff, this instruction will change it to 0x0000 and set the C flag;
+                                                ; otherwise the result will be non-zero, and the C flag will not be set.
+      brne        erase_page                    ; If the address was not 0xffff, jump to the regular flash write code, which would actually do nothing,
+                                                ; because the r27 (XH) register is still 0 at this point.
+      out         _SFR_IO_ADDR(SREG), rZERO     ; Otherwise (the address was 0xffff) clear the BootLoaderActive flag (T flag in SREG),
+                                                ; and also clear all other flags at the same time (the C flag is important here).
+
+address_in_range:
+      ; At this point the C flag in SREG is set only if the address is inside the allowed range;
+      ; however, this still might be the EEPROM write command instead of a flash write.
+      sbrs        r30, 0                        ; If the address has bit 0 set, skip the next instruction, so that r27 will keep its current value (0),
+                                                ; and therefore the request will be ignored. (This may be used to add further protocol extensions.)
+      rol         r27                           ; Otherwise set r27 = 1 if the address is acceptable, or r27 = 0 otherwise (according to the C flag).
+      sbrs        r30, 1                        ; If the address has bit 1 set, skip the next instruction, so that r27 will keep its current value
+                                                ; (1 for EEPROM write, 0 if the request should be ignored).
+      lsl         r27                           ; Otherwise set r27 = 2 for the flash write command, or keep r27 = 0 for the START_APPLICATION command.
+      cbr         r30, 0x03                     ; Clear bits 0 and 1 of the address.
 
 erase_page:
+      ; At this point r27 determines the actual operation:
+      ;   - 0 - do nothing (it's either the START_APPLICATION command or an address which is out of range);
+      ;   - 1 - EEPROM write (the rest of OUT data contains 64 words with data and flag bytes);
+      ;   - 2 - flash write (the rest of OUT data contains 64 words to be written into the flash page).
+      ; The same value in r27 is also used as the address increment value.
 
       ldi         r17, (_BV(PGERS)|_BV(SPMEN))  ; load r17 with the value needed to erase the currently specified page
       rcall       do_SPM                        ; execute page erase (this function requires r17 to be loaded first with the right value for SPMCSR)
 
-clear_current_page_byte_address:
-      ldi         r27, (SPM_PAGESIZE/2)         ; load r27 with the number of words per page (128 bytes/2 = 64 words)
-                                                ; r27 will be decremented for every word (2 bytes) we write to the page buffer
-
+      ldi         reg_wLengthL, (SPM_PAGESIZE/2) ; load reg_wLengthL with the number of words per page (128 bytes/2 = 64 words)
+                                                ; reg_wLengthL will be decremented for every word (2 bytes) we write to the page buffer
 check_endpoint_for_more_data:
 
       ; if (!(((uint16_t)UEBCHX << 8) | UEBCLX))
@@ -775,20 +787,38 @@ load_word_data:
       ldd         r0, Y+oUEDATX                 ; Load r0 with LSB of data word
       ldd         r1, Y+oUEDATX                 ; Load r1 with MSB of data word
 
+      ; Perform the EEPROM byte write operation.  To make the code as small as possible, most
+      ; instructions are done unconditionally - only the final instruction which triggers the write is
+      ; skipped if the value in r27 does not select the EEPROM write operation.
+      out         _SFR_IO_ADDR(EEARL), r30      ; Load the low byte of the address into EEARL.
+      out         _SFR_IO_ADDR(EEARH), r31      ; Load the high byte of the address into EEARH.
+      out         _SFR_IO_ADDR(EEDR), r0        ; Load the data byte into EEDR.
+      sbrc        r27, 0                        ; Skip the next instruction if the current operation is not EEPROM write.
+      sbi         _SFR_IO_ADDR(EECR), EEMPE     ; Set the EEMPE bit in EECR to enable EEPROM write operations for the next 4 cycles.
+      sbrc        r1, 0                         ; Skip the next instruction if the write mask bit is not set for the current data byte.
+      sbi         _SFR_IO_ADDR(EECR), EEPE      ; Set the EEPE bit in EECR to trigger the EEPROM write operation.
+
+      ; Wait for the EEPROM write to complete.
+eeprom_wait:
+      sbic        _SFR_IO_ADDR(EECR), EEPE      ; Test the EEPE bit in EECR and exit the wait loop if the bit is not set.
+      rjmp        eeprom_wait                   ; Continue waiting if the EEPE bit was still set.
+
 write_page_buffer:
       ldi         r17, _BV(SPMEN)               ; load r17 with the value needed to write the current word to the page buffer
       rcall       do_SPM                        ; execute page buffer write (this function requires r17 to be loaded first with the right value for SPMCSR)
 
 increment_byte_address:
-      subi        r30, -2                       ; Increment the current address by 2.
-                                                ; Only the low byte needs to be incremented, because the block start address must be page aligned,
-                                                ; therefore any carry to the high byte may happen only past the end of the block.
+      add         r30, r27                      ; Increment the current address by 1 (for EEPROM) or 2 (for flash);
+                                                ; leave the address unchanged if no write operation was enabled.
+                                                ; Incrementing just the low byte is enough, because for flash write the block start address must be page aligned,
+                                                ; and for EEPROM write this is just an additional protocol restriction that must be respected by host software.
 
-      dec         r27                           ; decrement r27 (number of words per page)
-      brne        check_endpoint_for_more_data  ; loop while r27 is not equal to SPM_PAGESIZE (128)
+      dec         reg_wLengthL                  ; decrement reg_wLengthL (number of words per page)
+      brne        check_endpoint_for_more_data  ; loop while reg_wLengthL is not equal to SPM_PAGESIZE (128)
 
       ; Restore the page address in Z-Register
       subi        r30, SPM_PAGESIZE             ; Move the address back to the start of page (again only the low byte needs to be changed).
+                                                ; This will give some wrong value in the EEPROM write or noop cases, but it won't be actually used.
 
 write_page_to_flash:
       ldi         r17, (_BV(PGWRT)|_BV(SPMEN))  ; load r17 with the value needed to commit the current page buffer to the flash
@@ -811,36 +841,6 @@ finish_hid_request:
 
 UNHANDLED_DEVICE_TO_HOST:
       rjmp        UNHANDLED_SETUP_REQUEST       ; Go to UNHANDLED_SETUP_REQUEST
-
-eeprom_write:
-      ; EEPROM byte write operation.  4 bytes of parameters are expected in
-      ; the OUT data after the special address value:
-      ;   address (2 bytes, low byte first)
-      ;   data (1 byte)
-      ;   dummy (1 byte) for alignment
-      
-      ; Read EEPROM address from the packet data
-      ldd         r30, y+oUEDATX
-      ldd         r31, y+oUEDATX
-
-      ; Read the data byte to be written from the packet data.
-      ldd         r0, y+oUEDATX
-      ldd         r1, y+oUEDATX
-
-      ; Start the EEPROM write operation.
-      out         _SFR_IO_ADDR(EEARL), r30
-      out         _SFR_IO_ADDR(EEARH), r31
-      out         _SFR_IO_ADDR(EEDR), r0
-      sbi         _SFR_IO_ADDR(EECR), EEMPE
-      sbi         _SFR_IO_ADDR(EECR), EEPE
-
-      ; Wait for the EEPROM write to complete.
-eeprom_wait:
-      sbic        _SFR_IO_ADDR(EECR), EEPE
-      rjmp        eeprom_wait
-
-      ldi         r27, (SPM_PAGESIZE/2)-2       ; load r27 with the number of words to be consumed
-      rjmp        check_endpoint_for_more_data
 
 HANDLE_USB_STANDARD_DEVICE:
 
@@ -1059,10 +1059,10 @@ do_SPM:
 
       ; NOTE: This function assumes r17 already has the correct value for the SPMCSR register, depending on the
       ; desired SPM operation
-      ; NOTE: If bit 7 of reg_bRequest is set to 1, the actual SPM instruction will not be executed
+      ; NOTE: If bit 1 of r27 is not set, the actual SPM instruction will not be executed
       ; (the wait loop will still run, but should just complete immediately).
       out         _SFR_IO_ADDR(SPMCSR), r17     ; store value in r17 to the Store Program Memory Control and Status Register (SPMCSR)
-      sbrs        reg_bRequest, 7               ; Skip the actual flash operation if the "disable flash write" bit is set.
+      sbrc        r27, 1                        ; Skip the actual flash operation if bit 1 of r27 is not set.
                                                 ; This is apparently safe, because the SPM instruction must be executed within 4 cycles after setting SPMEN,
                                                 ; and the sbrs instruction takes just 1 cycle when not skipping.
       spm                                       ; execute spm instruction based on the value loaded to SPMCSR
