@@ -834,12 +834,8 @@ finish_hid_request:
 
       ; Acknowledge the OUT packet and wait for TXINI (OK to transmit)
       ldi         r17, ~(_BV(RXOUTI))           ; Clear the Received OUT Data Interrupt Flag (RXOUTI) in r17
-      ldi         r16, _BV(TXINI)
-      rcall       clear_UEINTX_bit_and_wait     ; This function loads r17 with value of UEINTX
-
-      ; Clear Transmitter Ready Flag
-      ldi         r17, ~(_BV(TXINI))            ; Clear the Transmitter Ready Interrupt Flag (TXINI) in r17
-      rjmp        clear_UEINTX_bit_and_reti     ; Store r17 to the USB Endpoint Interrupt Register (UEINTX), then return from interrupt
+      rcall       process_Host2Device           ; Finish the Status stage and wait for ACK from the host
+      reti                                      ; Return from interrupt
 
 HANDLE_USB_STANDARD_DEVICE:
 
@@ -885,7 +881,8 @@ SET_ADDRESS:
 
       std         Y+oUDADDR, reg_wValueL        ; Store wValueL to the USB Device Address Register (UDADDR)
 
-      rcall       process_Host2Device           ; This function affects r17
+      ldi         r17, ~(_BV(RXSTPI))           ; Clear the Received SETUP Interrupt Flag (RXSTPI) in r17
+      rcall       process_Host2Device           ; Finish the Status stage and wait for ACK from the host
 
       ; EnableDeviceAddress
       ; UDADDR |= (1 << ADDEN)
@@ -988,7 +985,6 @@ send_packet_done:
 send_ack_out:
       ; Acknowledge the OUT packet
       ldi         r17, ~(_BV(RXOUTI))           ; Clear the Received OUT Data Interrupt Flag (RXOUTI) in r17
-clear_UEINTX_bit_and_reti:
       std         Y+oUEINTX, r17                ; Store r17 to the USB Endpoint Interrupt Register (UEINTX)
 
       reti                                      ; Return from interrupt
@@ -1027,10 +1023,20 @@ process_Host2Device:
 
       ; NOTE: All the functions here affect r17
 
-      ; Acknowledge the SETUP packet and wait for TXINI (OK to transmit)
-      ldi         r17, ~(_BV(RXSTPI))           ; Clear the Received SETUP Interrupt Flag (RXSTPI) in r17
+      ; Input:
+      ;  - r17 - the value to be written into the UEINTX register
+
+      ; 1. Clear the flag in UEINTX which is specified in r17 (acknowledge the Data or Setup stage,
+      ; depending on the parameter value), then wait for TXINI to be set (wait for the host to start the
+      ; Status stage).
+
       ldi         r16, _BV(TXINI)
       rcall       clear_UEINTX_bit_and_wait     ; This function loads r17 with value of UEINTX
+
+      ; 2. Clear the TXINI flag in UEINTX (reply with an empty data packet to finish the Status stage),
+      ; then wait for TXINI to be set again (wait for the host to acknowledge the Status stage).
+      ; This is handled using fallthrough instead of rcall followed by ret.
+      ; SIZE OPTIMIZATION: r16 does not need to be reloaded here.
 
 clear_TXINI_and_wait:
       ; Clear Transmitter Ready Flag and wait for TXINI (OK to transmit)
