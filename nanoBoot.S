@@ -935,8 +935,9 @@ process_descriptor:
       std         Y+oUEINTX, r17                ; Store r17 to the USB Endpoint Interrupt Register (UEINTX)
 
 verifyMaxDescriptorLength:
-      cp          reg_wLengthL, r16             ; Compare the value in r24 (wLengthL) against the value in r16 (length of descriptor to send)
-      brlo        send_descriptor               ; If the value in reg_wLengthL is smaller, use it to send the descriptor, jump to that tag
+      cp          reg_wLengthL, r16             ; Compare the low byte of wLength against the value in r16 (length of descriptor to send)
+      cpc         reg_wLengthH, rZERO           ; Compare the high byte of wLength against 0 (the implied high byte of the length of descriptor to send)
+      brlo        send_descriptor               ; If the wLength value was smaller than r16, use it to send the descriptor (only the low byte is actually used)
       mov         reg_wLengthL, r16             ; Otherwise, copy the value in r16 (which is the smaller of the two) to reg_wLengthL, and use that to send the descriptor
 
 send_descriptor:
