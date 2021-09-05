@@ -569,7 +569,7 @@ exit_bootloader:
       ldi         r17, _BV(WDE) | _BV(WDP2)     ; Load r17 with the value needed to set the desired Watchdog Configuration (WDCE = 0, not set!)
                                                 ; Write the WDE and Watchdog prescaler bits (WDP); System Reset Mode (WDE = 1) and ~250 ms timeout (WDP2 = 1)
 
-      rcall       set_watchdog_timer            ; Call the subroutine that sets the wathdog timer with the values loaded in r16 and r17
+      rcall       set_watchdog_timer            ; Call the subroutine that sets the watchdog timer with the values loaded in r16 and r17
                                                 ; This also loads YL with EIO_BASE.
 
    ; for (;;);
