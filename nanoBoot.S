@@ -693,8 +693,8 @@ load: ldd         r0, Y+oUEDATX                 ; Load r0 with the value in the 
       brne        load                          ; Jump back to 'load' if there are still bytes to read
 
       ; Our response is based on data direction...
-      sbrs        reg_bmRequestType, 7          ; Skip the next instruction if bit 7 of bmRequestType is set; for host to device (OUT) transaction, bit 7 is cleared
-      rjmp        HOST_TO_DEVICE                ; If bit 7 of bmRequestType is not set, this is a host to device (OUT) transaction, jump to HOST_TO_DEVICE
+      tst         reg_bmRequestType             ; Set the N and Z flags according to the value of bmRequestType
+      brpl        HOST_TO_DEVICE                ; If bmRequestType is positive (bit 7 is not set), jump to HOST_TO_DEVICE to handle the OUT transaction
 
 ; IN transactions
 DEVICE_TO_HOST:
@@ -849,7 +849,8 @@ SET_ADDRESS:
 HOST_TO_DEVICE:
 
       ; For OUT transactions, here we ONLY handle standard requests targeted for the device
-      cpi         reg_bmRequestType, 0x00       ; Compare r18 (bmRequestType) with value 0x00 (OUT Type Resquest, USB Standard Request, Recipient is the device)
+      ; SIZE OPTIMIZATION: SREG still contains flags set by "tst reg_bmRequestType", so a comparison
+      ; against 0 can be omitted.
       breq        HANDLE_USB_STANDARD_DEVICE    ; If bmRequestType is 0x00, we know it's either a SET_ADDRESS or SET_CONFIGURATION request, so jump to HANDLE_USB_STANDARD_DEVICE
 
       cpi         reg_bmRequestType, ((1 << 5) | (1 << 0))  ; Compare bmRequestType with the value that defines the request type and recipient we care about HID_SET_REPORT (REQTYPE_CLASS | REQREC_INTERFACE)
