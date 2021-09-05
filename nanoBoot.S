@@ -961,7 +961,7 @@ send_descriptor:
 
       ; NOTE: R17 already has the most current value of UEINTX, no need to load it again
       sbrc        r17, RXOUTI                   ; Skip the next instruction if the Received OUT Data Interrupt Flag (RXOUTI) is not set
-      rjmp        send_ack_out                  ; OUT received - the host aborted the data phase
+      rjmp        send_ack_out_if_no_RXSTPI     ; OUT received - the host aborted the data phase; RXSTPI is know to be not set here
 
       ; ASSUMPTION!! reg_wLengthL already has the maximum valid length we can use to send the descriptor,
       ; so we can just keep decrementing it until it reaches Zero
@@ -979,13 +979,12 @@ send_packet_done:
       ; Clear Transmitter Ready Flag
       ldi         r16, _BV(RXOUTI) | _BV(RXSTPI) ; Load the mask specifying the UEINTX bits to wait for (RXOUTI and RXSTPI)
       rcall       clear_TXINI_and_wait          ; Clear the TXINI flag and wait for either RXOUTI or RXSTPI
-      sbrc        r17, RXSTPI                   ; Skip the next instruction if the Received SETUP Interrupt Flag (RXSTPI) is cleared
-      reti                                      ; Return if RXSTPI is set, we need to prioritize SETUP packets
 
-send_ack_out:
-      ; Acknowledge the OUT packet
-      ldi         r17, ~(_BV(RXOUTI))           ; Clear the Received OUT Data Interrupt Flag (RXOUTI) in r17
-      std         Y+oUEINTX, r17                ; Store r17 to the USB Endpoint Interrupt Register (UEINTX)
+send_ack_out_if_no_RXSTPI:
+      ; Acknowledge the OUT packet if RXSTPI is not set in r17, then return from interrupt
+      ldi         r16, ~(_BV(RXOUTI))           ; Clear the Received OUT Data Interrupt Flag (RXOUTI) in r16
+      sbrs        r17, RXSTPI                   ; Skip the next instruction if the Received SETUP Interrupt Flag (RXSTPI) is set in r17
+      std         Y+oUEINTX, r16                ; Store r16 to the USB Endpoint Interrupt Register (UEINTX)
 
       reti                                      ; Return from interrupt
 
