@@ -1025,14 +1025,14 @@ process_Host2Device:
       ;  - r17 - the value to be written into the UEINTX register
 
       ; 1. Clear the flag in UEINTX which is specified in r17 (acknowledge the Data or Setup stage,
-      ; depending on the parameter value), then wait for TXINI to be set (wait for the host to start the
-      ; Status stage).
+      ; depending on the parameter value), then wait for TXINI to be set (the datasheet suggests that
+      ; this wait should succeed immediately, but the LUFA code checks this for some reason).
 
       ldi         r16, _BV(TXINI)
       rcall       clear_UEINTX_bit_and_wait     ; This function loads r17 with value of UEINTX
 
       ; 2. Clear the TXINI flag in UEINTX (reply with an empty data packet to finish the Status stage),
-      ; then wait for TXINI to be set again (wait for the host to acknowledge the Status stage).
+      ; then wait for TXINI to be set again (wait for the host to receive that empty data packet).
       ; This is handled using fallthrough instead of rcall followed by ret.
       ; SIZE OPTIMIZATION: r16 does not need to be reloaded here.
 
