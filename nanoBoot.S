@@ -954,14 +954,12 @@ verifyMaxDescriptorLength:
 
 send_descriptor:
 
-      ; Abort if RXSTPI is set
+      ; Abort if RXSTPI is set, acknowledge the OUT packet and abort if RXOUTI is set.
       ldd         r17, Y+oUEINTX                ; Load r17 with the value in the USB Endpoint Interrupt Register (UEINTX);
-      sbrc        r17, RXSTPI                   ; Skip the next instruction if the Received SETUP Interrupt Flag (RXSTPI) is cleared
-      reti                                      ; Return if RXSTPI is set, we need to prioritize SETUP packets
-
-      ; NOTE: R17 already has the most current value of UEINTX, no need to load it again
+      sbrs        r17, RXSTPI                   ; Skip the next instruction if the Received SETUP Interrupt Flag (RXSTPI) is set
+                                                ; (jump to send_ack_out_if_no_RXSTPI, and that code will just return from interrupt)
       sbrc        r17, RXOUTI                   ; Skip the next instruction if the Received OUT Data Interrupt Flag (RXOUTI) is not set
-      rjmp        send_ack_out_if_no_RXSTPI     ; OUT received - the host aborted the data phase; RXSTPI is know to be not set here
+      rjmp        send_ack_out_if_no_RXSTPI     ; Acknowledge the OUT packet if needed, then return from interrupt
 
       ; ASSUMPTION!! reg_wLengthL already has the maximum valid length we can use to send the descriptor,
       ; so we can just keep decrementing it until it reaches Zero
