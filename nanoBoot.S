@@ -693,8 +693,157 @@ load: ldd         r0, Y+oUEDATX                 ; Load r0 with the value in the 
       brne        load                          ; Jump back to 'load' if there are still bytes to read
 
       ; Our response is based on data direction...
-      sbrc        reg_bmRequestType, 7          ; Skip the next instruction if bit 7 of bmRequestType is not set; for host to device (OUT) transaction, bit 7 is cleared
-      rjmp        DEVICE_TO_HOST                ; If bit 7 of bmRequestType is set, this is a device to host (IN) transaction, jump to DEVICE_TO_HOST
+      sbrs        reg_bmRequestType, 7          ; Skip the next instruction if bit 7 of bmRequestType is set; for host to device (OUT) transaction, bit 7 is cleared
+      rjmp        HOST_TO_DEVICE                ; If bit 7 of bmRequestType is not set, this is a host to device (OUT) transaction, jump to HOST_TO_DEVICE
+
+; IN transactions
+DEVICE_TO_HOST:
+
+      ; If we get here, we know bit 7 of bmRequestType is set, meaning it is a DEVICE_TO_HOST (IN) request,
+      ; now we need to filter out any unhandled requests
+
+      ; SIZE OPTIMIZATION: The only bmRequestType values that we care about are:
+      ;  - 0x80 - IN Type Request, USB Standard Request, Recipient is the device
+      ;  - 0x81 - IN Type Request, USB Standard Request, Recipient is the interface
+      ; At this step it is known that bmRequestType >= 0x80, therefore checking for bmRequestType < 0x82
+      ; is enough to detect whether bmRequestType has one of the above values.
+
+      cpi         reg_bmRequestType, 0x82       ; Check whether bmRequestType is less than 0x82 (then it must be either 0x80 or 0x81)
+      brcc        UNHANDLED_SETUP_REQUEST       ; If bmRequestType >= 0x82, this request type is not handled here (it's not a GET_DESCRIPTOR request)
+
+      cpi         reg_bRequest, 0x06            ; Compare bRequest with value 0x06 (REQ_GetDescriptor)
+      brne        UNHANDLED_SETUP_REQUEST       ; jump to UNHANDLED_SETUP_REQUEST if not equal
+                                                ; fallthrough to GET_DESCRIPTOR if equal
+GET_DESCRIPTOR:
+
+      ; Just get the descriptor address into
+      ; [RAMPZ:]Z, and the length into r16
+
+      ldi         ZH, hi8(config_descriptor)    ; Load the high address part of config_descriptor into ZH
+      ldi         ZL, lo8(config_descriptor)    ; Load the low address part of config_descriptor into ZL
+      ldi         r16, 34                       ; Load r16 with length of config_descriptor (34 bytes)
+      cpi         reg_wValueH, 0x02             ; Compare high byte of wValue with value 2;
+      breq        process_descriptor            ; If high byte of wValue is 0x02 (Configuration Descriptor), jump to handle that
+      adiw        r30, hid_descriptor - config_descriptor               ; Change Z to point to hid_descriptor
+      cpi         reg_wValueH, 0x21             ; Compare high byte of wValue with value 0x21 (HID Class HID Descriptor)
+      ; The following code will also be reused for the device descriptor - both of these descriptors
+      ; contain the size in the first byte, and getting the size from there saves one instruction.  This
+      ; trick cannot be applied to the Configuration Descriptor (which is actually a collection of
+      ; multiple descriptors) and the HID Report Descriptor (which has a completely different format).
+process_single_descriptor:
+      lpm         r16, Z                        ; Load r16 with the first byte of descriptor, which contains its length in bytes.
+                                                ; This instruction does not change any flags in SREG, therefore it can be placed
+                                                ; between the compare and the corresponding conditional jump.
+      breq        process_descriptor            ; If the last compare result was equal, jump to return the descriptor data.
+      adiw        r30, device_descriptor - hid_descriptor               ; Change Z to point to device_descriptor
+      cpi         reg_wValueH, 0x01             ; Compare high byte of wValue with value 1;
+      breq        process_single_descriptor     ; If high byte of wValue is 0x01 (Device Descriptor), jump to handle that;
+                                                ; reuse the code for hid_descriptor above.
+      adiw        r30, hid_report_descriptor - device_descriptor        ; Change Z to point to hid_report_descriptor
+      ldi         r16, 21                       ; Load r16 with length of hid_report_descriptor (21 bytes)
+      cpi         reg_wValueH, 0x22             ; Compare high byte of wValue with value 0x22;
+      brne        UNHANDLED_SETUP_REQUEST       ; If high byte of wValue is NOT 0x22 (HID Class HID Report Descriptor), reject the setup request;
+                                                ; otherwise fallthrough to process_descriptor.
+
+process_descriptor:
+
+      ; Acknowledge the SETUP packet
+      ldi         r17, ~(_BV(RXSTPI))           ; Clear the Received SETUP Interrupt Flag (RXSTPI) in r17
+      std         Y+oUEINTX, r17                ; Store r17 to the USB Endpoint Interrupt Register (UEINTX)
+
+verifyMaxDescriptorLength:
+      cp          reg_wLengthL, r16             ; Compare the low byte of wLength against the value in r16 (length of descriptor to send)
+      cpc         reg_wLengthH, rZERO           ; Compare the high byte of wLength against 0 (the implied high byte of the length of descriptor to send)
+      brlo        send_descriptor               ; If the wLength value was smaller than r16, use it to send the descriptor (only the low byte is actually used)
+      mov         reg_wLengthL, r16             ; Otherwise, copy the value in r16 (which is the smaller of the two) to reg_wLengthL, and use that to send the descriptor
+
+send_descriptor:
+
+      ; Abort if RXSTPI is set, acknowledge the OUT packet and abort if RXOUTI is set.
+      ldd         r17, Y+oUEINTX                ; Load r17 with the value in the USB Endpoint Interrupt Register (UEINTX);
+      sbrs        r17, RXSTPI                   ; Skip the next instruction if the Received SETUP Interrupt Flag (RXSTPI) is set
+                                                ; (jump to send_ack_out_if_no_RXSTPI, and that code will just return from interrupt)
+      sbrc        r17, RXOUTI                   ; Skip the next instruction if the Received OUT Data Interrupt Flag (RXOUTI) is not set
+      rjmp        send_ack_out_if_no_RXSTPI     ; Acknowledge the OUT packet if needed, then return from interrupt
+
+      ; ASSUMPTION!! reg_wLengthL already has the maximum valid length we can use to send the descriptor,
+      ; so we can just keep decrementing it until it reaches Zero
+transfer_descriptor:
+      lpm         r16, Z+                       ; Load r16 with the value pointed by the Z-Register (descriptor to send), post-increment Z-Register
+      std         y+oUEDATX, r16                ; Store the value in r16 to the USB Endpoint Data Register (UEDATX)
+      dec         reg_wLengthL                  ; Decrement the value in reg_wLengthL
+      brne        transfer_descriptor           ; While reg_wLengthL is not Zero, loop back to transfer_descriptor
+
+      ; The data to be sent has been written to the UEDATX register
+      ; We must now signal the packet to send is complete
+
+send_packet_done:
+
+      ; Clear Transmitter Ready Flag
+      ldi         r16, _BV(RXOUTI) | _BV(RXSTPI) ; Load the mask specifying the UEINTX bits to wait for (RXOUTI and RXSTPI)
+      rcall       clear_TXINI_and_wait          ; Clear the TXINI flag and wait for either RXOUTI or RXSTPI
+
+send_ack_out_if_no_RXSTPI:
+      ; Acknowledge the OUT packet if RXSTPI is not set in r17, then return from interrupt
+      ldi         r16, ~(_BV(RXOUTI))           ; Clear the Received OUT Data Interrupt Flag (RXOUTI) in r16
+      sbrs        r17, RXSTPI                   ; Skip the next instruction if the Received SETUP Interrupt Flag (RXSTPI) is set in r17
+      std         Y+oUEINTX, r16                ; Store r16 to the USB Endpoint Interrupt Register (UEINTX)
+
+      reti                                      ; Return from interrupt
+
+HANDLE_USB_STANDARD_DEVICE:
+
+      ; Once we know we support the OUT transaction, we need to filter it based on the value in bRequest
+      cpi         reg_bRequest, 0x05            ; Compare bRequest with value 0x05 (REQ_SetAddress)
+      breq        SET_ADDRESS                   ; jump to SET_ADDRESS
+      cpi         reg_bRequest, 0x09            ; Compare bRequest with value 0x09 (REQ_SetConfiguration)
+      breq        SET_CONFIGURATION             ; jump to SET_CONFIGURATION
+
+UNHANDLED_SETUP_REQUEST:
+
+      ; If we reach this part, the SETUP packet has not been handled, so we need to acknowledge it and request a stall
+
+      ; Acknowledge the SETUP packet
+      ldi         r17, ~(_BV(RXSTPI))           ; Clear the Received SETUP Interrupt Flag (RXSTPI) in r17
+      std         Y+oUEINTX, r17                ; Store r17 to the USB Endpoint Interrupt Register (UEINTX)
+
+      ; STALL transaction
+
+      ; // Endpoint_StallTransaction();
+      ; UECONX |= (1 << STALLRQ);
+      ; Size optimization: We know that the only other bit that should be set in UECONX is EPEN, therefore
+      ; reading the current register value is not needed.
+      ldi         r16, _BV(STALLRQ) | _BV(EPEN) ; Set the STALL Request Handshake Bit (STALLRQ) and EPEN in r16
+      std         Y+oUECONX, r16                ; Store r16 to the USB Endpoint Configuration Register (UECONX)
+
+      reti                                      ; Return from interrupt
+
+SET_CONFIGURATION:
+
+      ; Dirty trick: We don't need to do anything for SET_CONFIGURATION except process_Host2Device,
+      ; so we reuse the SET_ADDRESS code by making it reload the same value to UDADDR.
+
+      ldd         reg_wValueL, Y+oUDADDR        ; load the existing UDADDR value where the SET_ADDRESS code would expect the new address
+
+SET_ADDRESS:
+
+      ; Set device address; for this we only need to copy the value in wValueL which contains the address
+      ; for the device set by the host to the USB Device Address Register (UDADDR); since the SET_ADDRESS
+      ; request is only executed once during enumeration, and because allowed address values are 1 through
+      ; 127 (7 LSBs), we don't need to care about the ADDEN bit (bit 7). We can also simply set the ADDEN
+      ; bit and store the value again in UDADDR to enable the USB Device Address.
+
+      std         Y+oUDADDR, reg_wValueL        ; Store wValueL to the USB Device Address Register (UDADDR)
+
+      ldi         r17, ~(_BV(RXSTPI))           ; Clear the Received SETUP Interrupt Flag (RXSTPI) in r17
+      rcall       process_Host2Device           ; Finish the Status stage and wait for ACK from the host
+
+      ; EnableDeviceAddress
+      ; UDADDR |= (1 << ADDEN)
+      ori         reg_wValueL, _BV(ADDEN)       ; In order to save space, we simply OR the address value already in reg_wValueL (r20) with the ADDEN bit to enable the USB Address
+      std         Y+oUDADDR, reg_wValueL        ; Store reg_wValueL to the USB Device Address Register (UDADDR)
+
+      reti                                      ; Return from interrupt
 
 ; OUT transactions
 HOST_TO_DEVICE:
@@ -835,155 +984,6 @@ finish_hid_request:
       ; Acknowledge the OUT packet and wait for TXINI (OK to transmit)
       ldi         r17, ~(_BV(RXOUTI))           ; Clear the Received OUT Data Interrupt Flag (RXOUTI) in r17
       rcall       process_Host2Device           ; Finish the Status stage and wait for ACK from the host
-      reti                                      ; Return from interrupt
-
-HANDLE_USB_STANDARD_DEVICE:
-
-      ; Once we know we support the OUT transaction, we need to filter it based on the value in bRequest
-      cpi         reg_bRequest, 0x05            ; Compare bRequest with value 0x05 (REQ_SetAddress)
-      breq        SET_ADDRESS                   ; jump to SET_ADDRESS
-      cpi         reg_bRequest, 0x09            ; Compare bRequest with value 0x09 (REQ_SetConfiguration)
-      breq        SET_CONFIGURATION             ; jump to SET_CONFIGURATION
-
-UNHANDLED_SETUP_REQUEST:
-
-      ; If we reach this part, the SETUP packet has not been handled, so we need to acknowledge it and request a stall
-
-      ; Acknowledge the SETUP packet
-      ldi         r17, ~(_BV(RXSTPI))           ; Clear the Received SETUP Interrupt Flag (RXSTPI) in r17
-      std         Y+oUEINTX, r17                ; Store r17 to the USB Endpoint Interrupt Register (UEINTX)
-
-      ; STALL transaction
-
-      ; // Endpoint_StallTransaction();
-      ; UECONX |= (1 << STALLRQ);
-      ; Size optimization: We know that the only other bit that should be set in UECONX is EPEN, therefore
-      ; reading the current register value is not needed.
-      ldi         r16, _BV(STALLRQ) | _BV(EPEN) ; Set the STALL Request Handshake Bit (STALLRQ) and EPEN in r16
-      std         Y+oUECONX, r16                ; Store r16 to the USB Endpoint Configuration Register (UECONX)
-
-      reti                                      ; Return from interrupt
-
-SET_CONFIGURATION:
-
-      ; Dirty trick: We don't need to do anything for SET_CONFIGURATION except process_Host2Device,
-      ; so we reuse the SET_ADDRESS code by making it reload the same value to UDADDR.
-
-      ldd         reg_wValueL, Y+oUDADDR        ; load the existing UDADDR value where the SET_ADDRESS code would expect the new address
-
-SET_ADDRESS:
-
-      ; Set device address; for this we only need to copy the value in wValueL which contains the address
-      ; for the device set by the host to the USB Device Address Register (UDADDR); since the SET_ADDRESS
-      ; request is only executed once during enumeration, and because allowed address values are 1 through
-      ; 127 (7 LSBs), we don't need to care about the ADDEN bit (bit 7). We can also simply set the ADDEN
-      ; bit and store the value again in UDADDR to enable the USB Device Address.
-
-      std         Y+oUDADDR, reg_wValueL        ; Store wValueL to the USB Device Address Register (UDADDR)
-
-      ldi         r17, ~(_BV(RXSTPI))           ; Clear the Received SETUP Interrupt Flag (RXSTPI) in r17
-      rcall       process_Host2Device           ; Finish the Status stage and wait for ACK from the host
-
-      ; EnableDeviceAddress
-      ; UDADDR |= (1 << ADDEN)
-      ori         reg_wValueL, _BV(ADDEN)       ; In order to save space, we simply OR the address value already in reg_wValueL (r20) with the ADDEN bit to enable the USB Address
-      std         Y+oUDADDR, reg_wValueL        ; Store reg_wValueL to the USB Device Address Register (UDADDR)
-
-      reti                                      ; Return from interrupt
-
-; IN transactions
-DEVICE_TO_HOST:
-
-      ; If we get here, we know bit 7 of bmRequestType is set, meaning it is a DEVICE_TO_HOST (IN) request,
-      ; now we need to filter out any unhandled requests
-
-      ; SIZE OPTIMIZATION: The only bmRequestType values that we care about are:
-      ;  - 0x80 - IN Type Request, USB Standard Request, Recipient is the device
-      ;  - 0x81 - IN Type Request, USB Standard Request, Recipient is the interface
-      ; At this step it is known that bmRequestType >= 0x80, therefore checking for bmRequestType < 0x82
-      ; is enough to detect whether bmRequestType has one of the above values.
-
-      cpi         reg_bmRequestType, 0x82       ; Check whether bmRequestType is less than 0x82 (then it must be either 0x80 or 0x81)
-      brcc        UNHANDLED_SETUP_REQUEST       ; If bmRequestType >= 0x82, this request type is not handled here (it's not a GET_DESCRIPTOR request)
-
-      cpi         reg_bRequest, 0x06            ; Compare bRequest with value 0x06 (REQ_GetDescriptor)
-      brne        UNHANDLED_SETUP_REQUEST       ; jump to UNHANDLED_SETUP_REQUEST if not equal
-                                                ; fallthrough to GET_DESCRIPTOR if equal
-GET_DESCRIPTOR:
-
-      ; Just get the descriptor address into
-      ; [RAMPZ:]Z, and the length into r16
-
-      ldi         ZH, hi8(config_descriptor)    ; Load the high address part of config_descriptor into ZH
-      ldi         ZL, lo8(config_descriptor)    ; Load the low address part of config_descriptor into ZL
-      ldi         r16, 34                       ; Load r16 with length of config_descriptor (34 bytes)
-      cpi         reg_wValueH, 0x02             ; Compare high byte of wValue with value 2;
-      breq        process_descriptor            ; If high byte of wValue is 0x02 (Configuration Descriptor), jump to handle that
-      adiw        r30, hid_descriptor - config_descriptor               ; Change Z to point to hid_descriptor
-      cpi         reg_wValueH, 0x21             ; Compare high byte of wValue with value 0x21 (HID Class HID Descriptor)
-      ; The following code will also be reused for the device descriptor - both of these descriptors
-      ; contain the size in the first byte, and getting the size from there saves one instruction.  This
-      ; trick cannot be applied to the Configuration Descriptor (which is actually a collection of
-      ; multiple descriptors) and the HID Report Descriptor (which has a completely different format).
-process_single_descriptor:
-      lpm         r16, Z                        ; Load r16 with the first byte of descriptor, which contains its length in bytes.
-                                                ; This instruction does not change any flags in SREG, therefore it can be placed
-                                                ; between the compare and the corresponding conditional jump.
-      breq        process_descriptor            ; If the last compare result was equal, jump to return the descriptor data.
-      adiw        r30, device_descriptor - hid_descriptor               ; Change Z to point to device_descriptor
-      cpi         reg_wValueH, 0x01             ; Compare high byte of wValue with value 1;
-      breq        process_single_descriptor     ; If high byte of wValue is 0x01 (Device Descriptor), jump to handle that;
-                                                ; reuse the code for hid_descriptor above.
-      adiw        r30, hid_report_descriptor - device_descriptor        ; Change Z to point to hid_report_descriptor
-      ldi         r16, 21                       ; Load r16 with length of hid_report_descriptor (21 bytes)
-      cpi         reg_wValueH, 0x22             ; Compare high byte of wValue with value 0x22;
-      brne        UNHANDLED_SETUP_REQUEST       ; If high byte of wValue is NOT 0x22 (HID Class HID Report Descriptor), reject the setup request;
-                                                ; otherwise fallthrough to process_descriptor.
-
-process_descriptor:
-
-      ; Acknowledge the SETUP packet
-      ldi         r17, ~(_BV(RXSTPI))           ; Clear the Received SETUP Interrupt Flag (RXSTPI) in r17
-      std         Y+oUEINTX, r17                ; Store r17 to the USB Endpoint Interrupt Register (UEINTX)
-
-verifyMaxDescriptorLength:
-      cp          reg_wLengthL, r16             ; Compare the low byte of wLength against the value in r16 (length of descriptor to send)
-      cpc         reg_wLengthH, rZERO           ; Compare the high byte of wLength against 0 (the implied high byte of the length of descriptor to send)
-      brlo        send_descriptor               ; If the wLength value was smaller than r16, use it to send the descriptor (only the low byte is actually used)
-      mov         reg_wLengthL, r16             ; Otherwise, copy the value in r16 (which is the smaller of the two) to reg_wLengthL, and use that to send the descriptor
-
-send_descriptor:
-
-      ; Abort if RXSTPI is set, acknowledge the OUT packet and abort if RXOUTI is set.
-      ldd         r17, Y+oUEINTX                ; Load r17 with the value in the USB Endpoint Interrupt Register (UEINTX);
-      sbrs        r17, RXSTPI                   ; Skip the next instruction if the Received SETUP Interrupt Flag (RXSTPI) is set
-                                                ; (jump to send_ack_out_if_no_RXSTPI, and that code will just return from interrupt)
-      sbrc        r17, RXOUTI                   ; Skip the next instruction if the Received OUT Data Interrupt Flag (RXOUTI) is not set
-      rjmp        send_ack_out_if_no_RXSTPI     ; Acknowledge the OUT packet if needed, then return from interrupt
-
-      ; ASSUMPTION!! reg_wLengthL already has the maximum valid length we can use to send the descriptor,
-      ; so we can just keep decrementing it until it reaches Zero
-transfer_descriptor:
-      lpm         r16, Z+                       ; Load r16 with the value pointed by the Z-Register (descriptor to send), post-increment Z-Register
-      std         y+oUEDATX, r16                ; Store the value in r16 to the USB Endpoint Data Register (UEDATX)
-      dec         reg_wLengthL                  ; Decrement the value in reg_wLengthL
-      brne        transfer_descriptor           ; While reg_wLengthL is not Zero, loop back to transfer_descriptor
-
-      ; The data to be sent has been written to the UEDATX register
-      ; We must now signal the packet to send is complete
-
-send_packet_done:
-
-      ; Clear Transmitter Ready Flag
-      ldi         r16, _BV(RXOUTI) | _BV(RXSTPI) ; Load the mask specifying the UEINTX bits to wait for (RXOUTI and RXSTPI)
-      rcall       clear_TXINI_and_wait          ; Clear the TXINI flag and wait for either RXOUTI or RXSTPI
-
-send_ack_out_if_no_RXSTPI:
-      ; Acknowledge the OUT packet if RXSTPI is not set in r17, then return from interrupt
-      ldi         r16, ~(_BV(RXOUTI))           ; Clear the Received OUT Data Interrupt Flag (RXOUTI) in r16
-      sbrs        r17, RXSTPI                   ; Skip the next instruction if the Received SETUP Interrupt Flag (RXSTPI) is set in r17
-      std         Y+oUEINTX, r16                ; Store r16 to the USB Endpoint Interrupt Register (UEINTX)
-
       reti                                      ; Return from interrupt
 
 
