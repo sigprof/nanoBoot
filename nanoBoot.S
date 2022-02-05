@@ -57,7 +57,7 @@
 ; see "Enable LED" in the "run_bootloader" section for details.
 
 ; Uncomment the following line to enable LED feature
-; #define LED_ENABLED
+#define LED_ENABLED
 
 ; LED Configuration
 ; Uncomment or add a new LED configuration for your specific board
@@ -72,10 +72,10 @@
 
 ; Teensy 2.0 compatible board
 ;   -- LED is ON with ATmega32u4 PIN D6 HIGH
-; #define LED_BIT           6
-; #define LED_CONF          DDRD
-; #define LED_PORT          PORTD
-; #define LED_ACTIVE_LEVEL  1
+#define LED_BIT           6
+#define LED_CONF          DDRD
+#define LED_PORT          PORTD
+#define LED_ACTIVE_LEVEL  1
 
 ; Leonardo/Nano compatible board
 ;   -- LED is ON with ATmega32u4 PIN C7 HIGH
